@@ -12,7 +12,13 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.max_num_delta_states = config.max_num_delta_states if config.is_qwen3_5 else None
+        self.max_model_len = config.max_model_len if config.is_qwen3_5 else None
+        self.resident_seq_ids: set[int] = set()
+        self.released_seq_ids: list[int] = []
+        # Reusing only KV would skip the tokens needed to rebuild DeltaNet state.
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+                                          enable_prefix_cache=not config.is_qwen3_5)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -20,7 +26,18 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if self.max_model_len is not None and len(seq) >= self.max_model_len:
+            raise ValueError("Qwen3.5 prompt must leave room for generation within max_model_len")
         self.waiting.append(seq)
+
+    def pop_released_seq_ids(self) -> list[int]:
+        seq_ids, self.released_seq_ids = self.released_seq_ids, []
+        return seq_ids
+
+    def release_state(self, seq: Sequence):
+        if seq.seq_id in self.resident_seq_ids:
+            self.resident_seq_ids.remove(seq.seq_id)
+            self.released_seq_ids.append(seq.seq_id)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
@@ -33,6 +50,9 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
+                if (self.max_num_delta_states is not None
+                        and len(self.resident_seq_ids) >= self.max_num_delta_states):
+                    break
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     break
@@ -43,6 +63,8 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+                if self.max_num_delta_states is not None:
+                    self.resident_seq_ids.add(seq.seq_id)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -55,7 +77,10 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        max_decode_seqs = self.max_num_seqs
+        if self.max_num_delta_states is not None:
+            max_decode_seqs = min(max_decode_seqs, self.max_num_batched_tokens)
+        while self.running and len(scheduled_seqs) < max_decode_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -68,6 +93,12 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
+        if not scheduled_seqs and self.max_num_delta_states is not None:
+            # If the last running request was preempted, restart its prefill
+            # after freeing both caches. An oversized history cannot make progress.
+            if self.waiting and self.block_manager.can_allocate(self.waiting[0]) != -1:
+                return self.schedule()
+            raise RuntimeError("No Qwen3.5 request fits in the KV cache; reduce the request length or increase cache memory")
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
@@ -76,6 +107,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        self.release_state(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -86,7 +118,10 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            reached_context_limit = self.max_model_len is not None and len(seq) >= self.max_model_len
+            if ((not seq.ignore_eos and token_id == self.eos)
+                    or seq.num_completion_tokens == seq.max_tokens or reached_context_limit):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
+                self.release_state(seq)
                 self.running.remove(seq)

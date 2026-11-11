@@ -43,6 +43,21 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Qwen3.5-2B text inference
+
+With a local unquantized Qwen3.5-2B checkpoint and a Transformers release that
+recognizes `qwen3_5`, use the single GPU eager path. The example requires the
+CUDA, Triton and FlashAttention dependencies used by the engine.
+
+```bash
+python example_qwen3_5.py /path/to/Qwen3.5-2B "用一句话解释 KV cache"
+```
+
+`max_num_delta_states` limits how many requests can keep DeltaNet state across
+steps. Its default for Qwen3.5 is `min(max_num_seqs, 16)`. The example starts with
+two slots and a small prefill budget. Qwen3.5 reuses both caches within a request,
+including across prefill chunks. Prefix sharing across requests is disabled.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
